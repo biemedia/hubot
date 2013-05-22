@@ -1,32 +1,55 @@
-Fs           = require 'fs'
-Log          = require 'log'
-Path         = require 'path'
-Url          = require 'url'
+Fs             = require 'fs'
+Log            = require 'log'
+Path           = require 'path'
+HttpClient     = require 'scoped-http-client'
+{EventEmitter} = require 'events'
 
-Brain        = require './brain'
-User         = require './user'
+User                                        = require './user'
+Brain                                       = require './brain'
+Response                                    = require './response'
+{Listener,TextListener}                     = require './listener'
+{EnterMessage,LeaveMessage,CatchAllMessage} = require './message'
 
-HUBOT_DEFAULT_ADAPTERS = [ "campfire", "shell" ]
+HUBOT_DEFAULT_ADAPTERS = [
+  'campfire'
+  'shell'
+]
+
+HUBOT_DOCUMENTATION_SECTIONS = [
+  'description'
+  'dependencies'
+  'configuration'
+  'commands'
+  'notes'
+  'author'
+  'examples'
+  'urls'
+]
 
 class Robot
   # Robots receive messages from a chat source (Campfire, irc, etc), and
   # dispatch them to matching listeners.
   #
-  # path - String directory full of Hubot scripts to load.
-  constructor: (adapterPath, adapter, name = "Hubot") ->
-    @name        = name
-    @brain       = new Brain
-    @alias       = false
-    @adapter     = null
-    @commands    = []
-    @Response    = Robot.Response
-    @listeners   = []
-    @loadPaths   = []
-    @enableSlash = false
+  # adapterPath - A String of the path to local adapters.
+  # adapter     - A String of the adapter name.
+  # httpd       - A Boolean whether to enable the HTTP daemon.
+  # name        - A String of the robot name, defaults to Hubot.
+  #
+  # Returns nothing.
+  constructor: (adapterPath, adapter, httpd, name = 'Hubot') ->
+    @name      = name
+    @brain     = new Brain
+    @events    = new EventEmitter
+    @alias     = false
+    @adapter   = null
+    @Response  = Response
+    @commands  = []
+    @listeners = []
+    @logger    = new Log process.env.HUBOT_LOG_LEVEL or 'info'
 
-    @logger      = new Log process.env.HUBOT_LOG_LEVEL or "info"
-
-    @loadAdapter adapterPath, adapter if adapter?
+    @parseVersion()
+    @setupExpress() if httpd
+    @loadAdapter adapterPath, adapter
 
   # Public: Adds a Listener that attempts to match incoming messages based on
   # a Regex.
@@ -39,7 +62,7 @@ class Robot
     @listeners.push new TextListener(@, regex, callback)
 
   # Public: Adds a Listener that attempts to match incoming messages directed
-  # at the robot based on a Regex.  All regexes treat patterns like they begin
+  # at the robot based on a Regex. All regexes treat patterns like they begin
   # with a '^'
   #
   # regex    - A Regex that determines if the callback should be called.
@@ -47,23 +70,30 @@ class Robot
   #
   # Returns nothing.
   respond: (regex, callback) ->
-    re = regex.toString().split("/")
-    re.shift()           # remove empty first item
-    modifiers = re.pop() # pop off modifiers
+    re = regex.toString().split('/')
+    re.shift()
+    modifiers = re.pop()
 
-    if re[0] and re[0][0] is "^"
-      @logger.warning "Anchors don't work well with respond, perhaps you want to use 'hear'"
+    if re[0] and re[0][0] is '^'
+      @logger.warning \
+        "Anchors don't work well with respond, perhaps you want to use 'hear'"
       @logger.warning "The regex in question was #{regex.toString()}"
 
-    pattern = re.join("/") # combine the pattern back again
+    pattern = re.join('/')
+    name = @name.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')
 
     if @alias
-      alias = @alias.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&") # escape alias for regexp
-      newRegex = new RegExp("^(?:#{alias}[:,]?|#{@name}[:,]?)\\s*(?:#{pattern})", modifiers)
+      alias = @alias.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&')
+      newRegex = new RegExp(
+        "^[@]?(?:#{alias}[:,]?|#{name}[:,]?)\\s*(?:#{pattern})"
+        modifiers
+      )
     else
-      newRegex = new RegExp("^#{@name}[:,]?\\s*(?:#{pattern})", modifiers)
+      newRegex = new RegExp(
+        "^[@]?#{name}[:,]?\\s*(?:#{pattern})",
+        modifiers
+      )
 
-    @logger.debug newRegex.toString()
     @listeners.push new TextListener(@, newRegex, callback)
 
   # Public: Adds a Listener that triggers when anyone enters the room.
@@ -72,7 +102,11 @@ class Robot
   #
   # Returns nothing.
   enter: (callback) ->
-    @listeners.push new Listener(@, ((msg) -> msg instanceof Robot.EnterMessage), callback)
+    @listeners.push new Listener(
+      @,
+      ((msg) -> msg instanceof EnterMessage),
+      callback
+    )
 
   # Public: Adds a Listener that triggers when anyone leaves the room.
   #
@@ -80,38 +114,55 @@ class Robot
   #
   # Returns nothing.
   leave: (callback) ->
-    @listeners.push new Listener(@, ((msg) -> msg instanceof Robot.LeaveMessage), callback)
+    @listeners.push new Listener(
+      @,
+      ((msg) -> msg instanceof LeaveMessage),
+      callback
+    )
+
+  # Public: Adds a Listener that triggers when anyone changes the topic.
+  #
+  # callback - A Function that is called with a Response object.
+  #
+  # Returns nothing.
+  topic: (callback) ->
+    @listeners.push new Listener(
+      @,
+      ((msg) -> msg instanceof TopicMessage),
+      callback
+    )
+
+  # Public: Adds a Listener that triggers when no other text matchers match.
+  #
+  # callback - A Function that is called with a Response object.
+  #
+  # Returns nothing.
+  catchAll: (callback) ->
+    @listeners.push new Listener(
+      @,
+      ((msg) -> msg instanceof CatchAllMessage),
+      ((msg) -> msg.message = msg.message.message; callback msg)
+    )
 
   # Public: Passes the given message to any interested Listeners.
   #
-  # message - A Robot.Message instance. Listeners can flag this message as
-  #  'done' to prevent further execution
+  # message - A Message instance. Listeners can flag this message as 'done' to
+  #           prevent further execution.
   #
   # Returns nothing.
   receive: (message) ->
+    results = []
     for listener in @listeners
       try
-        listener.call message
+        results.push listener.call(message)
         break if message.done
-      catch ex
-        @logger.error "Unable to call the listener: #{ex}"
+      catch error
+        @logger.error "Unable to call the listener: #{error}\n#{error.stack}"
+        false
+    if message not instanceof CatchAllMessage and results.indexOf(true) is -1
+      @receive new CatchAllMessage(message)
 
-
-  # Public: Loads every script in the given path.
-  #
-  # path - A String path on the filesystem.
-  #
-  # Returns nothing.
-  load: (path) ->
-    @logger.info "Loading scripts from #{path}"
-
-    Path.exists path, (exists) =>
-      if exists
-        @loadPaths.push path
-        for file in Fs.readdirSync(path)
-          @loadFile path, file
-
-  # Public: Loads a file in path
+  # Public: Loads a file in path.
   #
   # path - A String path on the filesystem.
   # file - A String filename in path on the filesystem.
@@ -124,13 +175,76 @@ class Robot
       try
         require(full) @
         @parseHelp "#{path}/#{file}"
-      catch err
-        @logger.error "#{err}"
+      catch error
+        @logger.error "Unable to load #{full}: #{error.stack}"
+        process.exit(1)
 
+  # Public: Loads every script in the given path.
+  #
+  # path - A String path on the filesystem.
+  #
+  # Returns nothing.
+  load: (path) ->
+    @logger.debug "Loading scripts from #{path}"
+    Fs.exists path, (exists) =>
+      if exists
+        for file in Fs.readdirSync(path)
+          @loadFile path, file
+
+  # Public: Load scripts specfied in the `hubot-scripts.json` file.
+  #
+  # path    - A String path to the hubot-scripts files.
+  # scripts - An Array of scripts to load.
+  #
+  # Returns nothing.
   loadHubotScripts: (path, scripts) ->
-    @logger.info "Loading hubot-scripts from #{path}"
+    @logger.debug "Loading hubot-scripts from #{path}"
     for script in scripts
       @loadFile path, script
+
+  # Public: Load scripts from packages specfied in the
+  # `external-scripts.json` file.
+  #
+  # packages - An Array of packages containing hubot scripts to load.
+  #
+  # Returns nothing.
+  loadExternalScripts: (packages) ->
+    @logger.debug "Loading external-scripts from npm packages"
+    for pkg in packages
+      try
+        require(pkg) @
+        @parseHelp require.resolve(pkg)
+      catch error
+        @logger.error "Error loading scripts from npm package - #{error}"
+        process.exit(1)
+
+  # Setup the Express server's defaults.
+  #
+  # Returns nothing.
+  setupExpress: ->
+    user    = process.env.EXPRESS_USER
+    pass    = process.env.EXPRESS_PASSWORD
+    stat    = process.env.EXPRESS_STATIC
+
+    express = require 'express'
+
+    app = express()
+    app.use express.basicAuth user, pass if user and pass
+    app.use express.query()
+    app.use express.bodyParser()
+    app.use express.static stat if stat
+
+    @server = app.listen process.env.PORT || 8080
+    @router = app
+
+    herokuUrl = process.env.HEROKU_URL
+
+    if herokuUrl
+      herokuUrl += '/' unless /\/$/.test herokuUrl
+      setInterval =>
+        HttpClient.create("#{herokuUrl}hubot/ping").post() (err, res, body) =>
+          @logger.info 'keep alive ping!'
+      , 1200000
 
   # Load the adapter Hubot is going to use.
   #
@@ -139,7 +253,7 @@ class Robot
   #
   # Returns nothing.
   loadAdapter: (path, adapter) ->
-    @logger.info "Loading adapter #{adapter}"
+    @logger.debug "Loading adapter #{adapter}"
 
     try
       path = if adapter in HUBOT_DEFAULT_ADAPTERS
@@ -147,229 +261,134 @@ class Robot
       else
         "hubot-#{adapter}"
 
-      @adapter = require("#{path}").use(@)
+      @adapter = require(path).use @
     catch err
       @logger.error "Cannot load adapter #{adapter} - #{err}"
+      process.exit(1)
 
-  # Public: Help Commands for Running Scripts
+  # Public: Help Commands for Running Scripts.
   #
-  # Returns an array of help commands for running scripts
+  # Returns an Array of help commands for running scripts.
   helpCommands: ->
     @commands.sort()
 
-  # Private: load help info from a loaded script
+  # Private: load help info from a loaded script.
   #
-  # path - The path to the file on disk
+  # path - A String path to the file on disk.
   #
-  # Returns nothing
+  # Returns nothing.
   parseHelp: (path) ->
-    Fs.readFile path, "utf-8", (err, body) =>
+    @logger.debug "Parsing help for #{path}"
+    scriptName = Path.basename(path).replace /\.(coffee|js)$/, ''
+    scriptDocumentation = {}
+
+    Fs.readFile path, 'utf-8', (err, body) =>
       throw err if err?
-      for i, line of body.split("\n")
-        break    if !(line[0] == '#' or line.substr(0, 2) == '//')
-        continue if !line.match('-')
-        @commands.push line[2..line.length]
+
+      currentSection = null
+      for line in body.split "\n"
+        break unless line[0] is '#' or line.substr(0, 2) is '//'
+
+        cleanedLine = line.replace(/^(#|\/\/)\s?/, "").trim()
+
+        continue if cleanedLine.length is 0
+        continue if cleanedLine.toLowerCase() is 'none'
+
+        nextSection = cleanedLine.toLowerCase().replace(':', '')
+        if nextSection in HUBOT_DOCUMENTATION_SECTIONS
+          currentSection = nextSection
+          scriptDocumentation[currentSection] = []
+        else
+          if currentSection
+            scriptDocumentation[currentSection].push cleanedLine.trim()
+            if currentSection is 'commands'
+              @commands.push cleanedLine.trim()
+
+      if currentSection is null
+        @logger.info "#{path} is using deprecated documentation syntax"
+        scriptDocumentation.commands = []
+        for line in body.split("\n")
+          break    if not (line[0] is '#' or line.substr(0, 2) is '//')
+          continue if not line.match('-')
+          cleanedLine = line[2..line.length].replace(/^hubot/i, @name).trim()
+          scriptDocumentation.commands.push cleanedLine
+          @commands.push cleanedLine
 
   # Public: A helper send function which delegates to the adapter's send
   # function.
   #
   # user    - A User instance.
   # strings - One or more Strings for each message to send.
+  #
+  # Returns nothing.
   send: (user, strings...) ->
     @adapter.send user, strings...
-
-  # Public: A helper send function to message a room that the robot is in
-  #
-  # room    - String designating the room to message
-  # strings - One or more Strings for each message to send.
-  messageRoom: (room, strings...) ->
-    user = @userForId @id, { room: room }
-    @adapter.send user, strings...
-
 
   # Public: A helper reply function which delegates to the adapter's reply
   # function.
   #
   # user    - A User instance.
   # strings - One or more Strings for each message to send.
+  #
+  # Returns nothing.
   reply: (user, strings...) ->
     @adapter.reply user, strings...
 
-  # Public: Get an Array of User objects stored in the brain.
-  users: ->
-    @brain.data.users
-
-  # Public: Get a User object given a unique identifier.
-  userForId: (id, options) ->
-    user = @brain.data.users[id]
-    unless user
-      user = new User id, options
-      @brain.data.users[id] = user
-    user
-
-  # Public: Get a User object given a name.
-  userForName: (name) ->
-    result = null
-    lowerName = name.toLowerCase()
-    for k of (@brain.data.users or { })
-      userName = @brain.data.users[k]['name']
-      if userName? and userName.toLowerCase() is lowerName
-        result = @brain.data.users[k]
-    result
-
-  # Public: Get all users whose names match fuzzyName. Currently, match
-  # means 'starts with', but this could be extended to match initials,
-  # nicknames, etc.
+  # Public: A helper send function to message a room that the robot is in.
   #
-  usersForRawFuzzyName: (fuzzyName) ->
-    lowerFuzzyName = fuzzyName.toLowerCase()
-    user for key, user of (@brain.data.users or {}) when (
-      user.name.toLowerCase().lastIndexOf(lowerFuzzyName, 0) == 0)
-
-  # Public: If fuzzyName is an exact match for a user, returns an array with
-  # just that user. Otherwise, returns an array of all users for which
-  # fuzzyName is a raw fuzzy match (see usersForRawFuzzyName).
+  # room    - String designating the room to message.
+  # strings - One or more Strings for each message to send.
   #
-  usersForFuzzyName: (fuzzyName) ->
-    matchedUsers = @usersForRawFuzzyName(fuzzyName)
-    lowerFuzzyName = fuzzyName.toLowerCase()
-    # We can scan matchedUsers rather than all users since usersForRawFuzzyName
-    # will include exact matches
-    for user in matchedUsers
-      return [user] if user.name.toLowerCase() is lowerFuzzyName
+  # Returns nothing.
+  messageRoom: (room, strings...) ->
+    user = { room: room }
+    @adapter.send user, strings...
 
-    matchedUsers
+  # Public: A wrapper around the EventEmitter API to make usage
+  # semanticly better.
+  #
+  # event    - The event name.
+  # listener - A Function that is called with the event parameter
+  #            when event happens.
+  #
+  # Returns nothing.
+  on: (event, args...) ->
+    @events.on event, args...
 
+  # Public: A wrapper around the EventEmitter API to make usage
+  # semanticly better.
+  #
+  # event   - The event name.
+  # args...  - Arguments emitted by the event
+  #
+  # Returns nothing.
+  emit: (event, args...) ->
+    @events.emit event, args...
+
+  # Public: Kick off the event loop for the adapter
+  #
+  # Returns nothing.
   run: ->
     @adapter.run()
 
+  # Public: Gracefully shutdown the robot process
+  #
+  # Returns nothing.
   shutdown: ->
     @adapter.close()
     @brain.close()
 
-class Robot.Message
-  # Represents an incoming message from the chat.
+  # Public: The version of Hubot from npm
   #
-  # user - A User instance that sent the message.
-  constructor: (@user, @done = false) ->
-
-  # Indicates that no other Listener should be called on this object
-  finish: () ->
-    @done = true
-
-class Robot.TextMessage extends Robot.Message
-  # Represents an incoming message from the chat.
-  #
-  # user - A User instance that sent the message.
-  # text - The String message contents.
-  constructor: (@user, @text) ->
-    super @user
-
-  # Determines if the message matches the given regex.
-  #
-  # regex - The Regex to check.
-  #
-  # Returns a Match object or null.
-  match: (regex) ->
-    @text.match regex
-
-# Represents an incoming user entrance notification.
-#
-# user - A User instance for the user who entered.
-class Robot.EnterMessage extends Robot.Message
-
-# Represents an incoming user exit notification.
-#
-# user - A User instance for the user who left.
-class Robot.LeaveMessage extends Robot.Message
-
-class Listener
-  # Listeners receive every message from the chat source and decide if they
-  # want to act on it.
-  #
-  # robot    - The current Robot instance.
-  # matcher  - The Function that determines if this listener should trigger the
-  #            callback.
-  # callback - The Function that is triggered if the incoming message matches.
-  constructor: (@robot, @matcher, @callback) ->
-
-  # Public: Determines if the listener likes the content of the message.  If
-  # so, a Response built from the given Message is passed to the Listener
-  # callback.
-  #
-  # message - a Robot.Message instance.
-  #
-  # Returns nothing.
-  call: (message) ->
-    if match = @matcher message
-      @callback new @robot.Response(@robot, message, match) 
-
-class TextListener extends Listener
-  # TextListeners receive every message from the chat source and decide if they want
-  # to act on it.
-  #
-  # robot    - The current Robot instance.
-  # regex    - The Regex that determines if this listener should trigger the
-  #            callback.
-  # callback - The Function that is triggered if the incoming message matches.
-  constructor: (@robot, @regex, @callback) ->
-    @matcher = (message) =>
-      if message instanceof Robot.TextMessage
-        message.match @regex
-
-class Robot.Response
-  # Public: Responses are sent to matching listeners.  Messages know about the
-  # content and user that made the original message, and how to reply back to
-  # them.
-  #
-  # robot   - The current Robot instance.
-  # message - The current Robot.Message instance.
-  # match   - The Match object from the successful Regex match.
-  constructor: (@robot, @message, @match) ->
-
-  # Public: Posts a message back to the chat source
-  #
-  # strings - One or more strings to be posted.  The order of these strings
-  #           should be kept intact.
-  #
-  # Returns nothing.
-  send: (strings...) ->
-    @robot.adapter.send @message.user, strings...
-
-  # Public: Posts a topic changing message
-  #
-  # strings - One or more strings to set as the topic of the
-  #           room the bot is in.
-  #
-  # Returns nothing.
-  topic: (strings...) ->
-    @robot.adapter.topic @message.user, strings...
-
-  # Public: Posts a message mentioning the current user.
-  #
-  # strings - One or more strings to be posted.  The order of these strings
-  #           should be kept intact.
-  #
-  # Returns nothing.
-  reply: (strings...) ->
-    @robot.adapter.reply @message.user, strings...
-
-  # Public: Picks a random item from the given items.
-  #
-  # items - An Array of items (usually Strings).
-  #
-  # Returns an random item.
-  random: (items) ->
-    items[ Math.floor(Math.random() * items.length) ]
-
-  # Public: Tell the message to stop dispatching to listeners
-  #
-  # Returns nothing.
-  finish: () ->
-    @message.finish()
+  # Returns a String of the version number.
+  parseVersion: ->
+    package_path = Path.join __dirname, '..', 'package.json'
+    data = Fs.readFileSync package_path, 'utf8'
+    content = JSON.parse data
+    @version = content.version
 
   # Public: Creates a scoped http client with chainable methods for
-  # modifying the request.  This doesn't actually make a request though.
+  # modifying the request. This doesn't actually make a request though.
   # Once your request is assembled, you can call `get()`/`post()`/etc to
   # send the request.
   #
@@ -397,11 +416,7 @@ class Robot.Response
   #
   # Returns a ScopedClient instance.
   http: (url) ->
-    @httpClient.create(url)
-
-HttpClient = require 'scoped-http-client'
-
-Robot.Response::httpClient = HttpClient
+    HttpClient.create(url)
+      .header('User-Agent', "Hubot/#{@version}")
 
 module.exports = Robot
-

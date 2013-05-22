@@ -13,6 +13,23 @@ those dependencies are provided by [npm][npmjs].
 
 [npmjs]: http://npmjs.org
 
+## HTTP Listener
+
+Hubot has a HTTP listener which listens on the port specified by the `PORT`
+environment variable.
+
+You can specify routes to listen on in your scripts by using the `router`
+property on `robot`.
+
+```coffeescript
+module.exports = (robot) ->
+  robot.router.get "/hubot/version", (req, res) ->
+    res.end robot.version
+```
+
+There are functions for GET, POST, PUT and DELETE, which all take a route and
+callback function that accepts a request and a response.
+
 ### Redis
 
 If you are going to use the `redis-brain.coffee` script from `hubot-scripts`
@@ -82,10 +99,25 @@ of adding it to hubot itself, you can submit pull requests to
 [hubot-scripts][hubot-scripts].
 
 To enable scripts from the hubot-scripts package, add the script name with
-extension as a double quoted string to the hubot-scripts.json file in this
+extension as a double quoted string to the `hubot-scripts.json` file in this
 repo.
 
 [hubot-scripts]: https://github.com/github/hubot-scripts
+
+## external-scripts
+
+Tired of waiting for your script to be merged into `hubot-scripts`? Want to
+maintain the repository and package yourself? Then this added functionality
+maybe for you!
+
+Hubot is now able to load scripts from third-party `npm` packages! To enable
+this functionality you can follow the following steps.
+
+1. Add the packages as dependencies into your `package.json`
+2. `npm install` to make sure those packages are installed
+
+To enable third-party scripts that you've added you will need to add the package
+name as a double quoted string to the `external-scripts.json` file in this repo.
 
 ## Deployment
 
@@ -111,7 +143,7 @@ If you would like to deploy to either a UNIX operating system or Windows.
 Please check out the [deploying hubot onto UNIX][deploy-unix] and
 [deploying hubot onto Windows][deploy-windows] wiki pages.
 
-[heroku-node-docs]: http://devcenter.heroku/com/articles/node-js
+[heroku-node-docs]: http://devcenter.heroku.com/articles/node-js
 [deploy-heroku]: https://github.com/github/hubot/wiki/Deploying-Hubot-onto-Heroku
 [deploy-unix]: https://github.com/github/hubot/wiki/Deploying-Hubot-onto-UNIX
 [deploy-windows]: https://github.com/github/hubot/wiki/Deploying-Hubot-onto-Windows
